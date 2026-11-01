@@ -83,6 +83,25 @@ log: retry 1/3 (รอ ~5s) → retry 2/3 (รอ ~10s) → retry 3/3 (รอ ~2
 
 
 ### เคส 4: เติมไม่สำเร็จ
+bot รายงานผลที่ `POST /bot/orders/:orderNo/result` body `{"botId","outcome","reason"}`
+- `SUCCESS` → `COMPLETED`
+- `TRANSIENT` (เช่น เกมล่มชั่วคราว) → คืน `QUEUED` + backoff `5s*2^attempts` จนครบ 3 ครั้งแล้ว `DELAYED` + alert (สูตรเดียวกับ reaper)
+- `PERMANENT` (เช่น UID ผิด) → `FAILED` ทันที ไม่เสียรอบ retry เหตุผลเก็บใน timeline
+
+ตรวจ lease ด้วย `FOR UPDATE` + `claimed_by`: bot ที่ lease หมดแล้วส่งผลมาได้ 409 `LEASE_LOST`
+
+ถ้าออเดอร์เป็น `FAILED`:
+- `POST /orders/:orderNo/fix-uid` body `{"gameUid"}` → `FAILED → QUEUED` และรีเซ็ต `attempts` ให้รอบ retry เริ่มใหม่
+- `POST /orders/:orderNo/refund` body `{"reason"}` → `FAILED/DELAYED → REFUNDED` + alert `REFUND_REQUIRED` ให้แอดมินโอนคืนจริง
+
+ทั้งสองล็อกแถวด้วย `FOR UPDATE` และเช็ก `CanTransition` สถานะไม่ตรงตอบ 409 `INVALID_STATE`
+`POST /orders/:orderNo/report-issue` ลูกค้าแจ้งปัญหา บันทึกเป็น alert `CUSTOMER_ISSUE` ไม่เปลี่ยนสถานะ ให้แอดมินตัดสิน
+
+เหตุผล:
+- แยก transient/permanent เพราะ UID ผิดลองกี่ครั้งก็ไม่ผ่าน ไม่ควรเสียรอบ retry และลูกค้าเห็นสาเหตุทันที
+- refund ไม่รวม `EXPIRED` เพราะออเดอร์ที่หมดอายุโดยไม่มีเงินเข้าไม่มีอะไรให้คืน (กรณีจ่ายมาช้าเคส 3 จัดการแล้ว)
+- ระบบเปลี่ยนสถานะและสร้าง alert ส่วนการโอนเงินคืนจริงเป็นงานแอดมิน
+ทดสอบ: PERMANENT → `FAILED`, fix-uid → `QUEUED`, refund → `REFUNDED`, refund ซ้ำ → 409, bot ผิดตัว → `LEASE_LOST`
 
 
 ### เคส 5: ออเดอร์ค้าง / หมดอายุ
@@ -117,3 +136,4 @@ error 500 ลูกค้าเห็นข้อความกลางๆ แ
 - ทดสอบ insert ซ้ำตรงเข้า DB เพื่อยืนยัน unique constraint
 - จำลอง bot ล่มและดู log retry/backoff จนถึง DELAYED
 - ตัดสินใจเองเรื่องตาราง state machine และเหตุผลของแต่ละเส้นทาง
+

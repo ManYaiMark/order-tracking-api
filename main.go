@@ -17,6 +17,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -500,6 +501,267 @@ func heartbeat(db *sql.DB) http.HandlerFunc {
 	}
 }
 
+func botResult(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		no := r.PathValue("orderNo")
+		if !orderNoRe.MatchString(no) {
+			writeErr(w, 400, "INVALID_ORDER_NO", "orderNo must match ORD-<digits>-<digits>")
+			return
+		}
+		var req struct {
+			BotID   string `json:"botId"`
+			Outcome string `json:"outcome"`
+			Reason  string `json:"reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BotID == "" {
+			writeErr(w, 400, "INVALID_BODY", "botId and outcome are required")
+			return
+		}
+		if req.Outcome != "SUCCESS" && req.Outcome != "TRANSIENT" && req.Outcome != "PERMANENT" {
+			writeErr(w, 400, "INVALID_OUTCOME", "outcome must be SUCCESS, TRANSIENT or PERMANENT")
+			return
+		}
+
+		tx, err := db.BeginTx(r.Context(), nil)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		defer tx.Rollback()
+
+		// ล็อกแถว + ตรวจว่า bot นี้ถือ lease อยู่จริง
+		var attempts int
+		err = tx.QueryRowContext(r.Context(), `
+			SELECT attempts FROM orders
+			WHERE order_no = $1 AND status = 'IN_PROGRESS' AND claimed_by = $2
+			FOR UPDATE`, no, req.BotID).Scan(&attempts)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 409, "LEASE_LOST", "order is not IN_PROGRESS or not claimed by this bot")
+			return
+		} else if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+
+		var to, reason string
+		switch req.Outcome {
+		case "SUCCESS":
+			to, reason = "COMPLETED", "top-up succeeded (bot="+req.BotID+")"
+			_, err = tx.ExecContext(r.Context(), `
+				UPDATE orders SET status='COMPLETED', claimed_by=NULL, lease_expires_at=NULL,
+				version=version+1, updated_at=now() WHERE order_no=$1`, no)
+		case "PERMANENT":
+			if req.Reason == "" {
+				req.Reason = "permanent error"
+			}
+			to, reason = "FAILED", "permanent failure: "+req.Reason+" (bot="+req.BotID+")"
+			_, err = tx.ExecContext(r.Context(), `
+				UPDATE orders SET status='FAILED', claimed_by=NULL, lease_expires_at=NULL,
+				version=version+1, updated_at=now() WHERE order_no=$1`, no)
+		case "TRANSIENT":
+			if req.Reason == "" {
+				req.Reason = "temporary error"
+			}
+			if attempts < maxRetries {
+				to, reason = "QUEUED", fmt.Sprintf("transient failure: %s; retry %d/%d queued (bot=%s)", req.Reason, attempts+1, maxRetries, req.BotID)
+				_, err = tx.ExecContext(r.Context(), `
+					UPDATE orders SET status='QUEUED', attempts=attempts+1,
+					next_attempt_at = now() + ($2::int * power(2, attempts)::int) * interval '1 second',
+					claimed_by=NULL, lease_expires_at=NULL,
+					version=version+1, updated_at=now() WHERE order_no=$1`, no, backoffBase)
+			} else {
+				to, reason = "DELAYED", "transient failure: "+req.Reason+"; max retries reached -> DELAYED (bot="+req.BotID+")"
+				_, err = tx.ExecContext(r.Context(), `
+					UPDATE orders SET status='DELAYED', next_attempt_at=NULL,
+					claimed_by=NULL, lease_expires_at=NULL,
+					version=version+1, updated_at=now() WHERE order_no=$1`, no)
+				if err == nil {
+					_, err = tx.ExecContext(r.Context(),
+						`INSERT INTO alerts (order_no, type, message) VALUES ($1,'BOT_UNRESPONSIVE',$2)`, no, reason)
+				}
+			}
+		}
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if !CanTransition(Status("IN_PROGRESS"), Status(to)) {
+			serverErr(w, r, fmt.Errorf("illegal transition IN_PROGRESS -> %s", to))
+			return
+		}
+		if _, err = tx.ExecContext(r.Context(), `
+			INSERT INTO order_events (order_no, from_status, to_status, reason)
+			VALUES ($1,'IN_PROGRESS',$2,$3)`, no, to, reason); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if err = tx.Commit(); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		log.Printf("order=%s result %s -> %s", no, req.Outcome, to)
+		writeJSON(w, 200, map[string]any{"orderNo": no, "status": to})
+	}
+}
+
+// ลูกค้าแจ้งปัญหา -> บันทึกเป็น alert ให้แอดมินเห็น (ไม่เปลี่ยนสถานะ)
+func reportIssue(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		no := r.PathValue("orderNo")
+		if !orderNoRe.MatchString(no) {
+			writeErr(w, 400, "INVALID_ORDER_NO", "orderNo must match ORD-<digits>-<digits>")
+			return
+		}
+		var req struct {
+			Message string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+			strings.TrimSpace(req.Message) == "" || len(req.Message) > 500 {
+			writeErr(w, 400, "INVALID_BODY", "message is required (max 500 chars)")
+			return
+		}
+		var st string
+		err := db.QueryRowContext(r.Context(), `SELECT status FROM orders WHERE order_no=$1`, no).Scan(&st)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "ORDER_NOT_FOUND", "order not found")
+			return
+		} else if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if _, err = db.ExecContext(r.Context(),
+			`INSERT INTO alerts (order_no, type, message) VALUES ($1,'CUSTOMER_ISSUE',$2)`,
+			no, req.Message); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		log.Printf("order=%s customer issue reported (status=%s)", no, st)
+		writeJSON(w, 201, map[string]any{"orderNo": no, "status": "RECEIVED"})
+	}
+}
+
+// แก้ UID แล้วลองใหม่: FAILED -> QUEUED
+func fixUID(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		no := r.PathValue("orderNo")
+		if !orderNoRe.MatchString(no) {
+			writeErr(w, 400, "INVALID_ORDER_NO", "orderNo must match ORD-<digits>-<digits>")
+			return
+		}
+		var req struct {
+			GameUID string `json:"gameUid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.GameUID) == "" {
+			writeErr(w, 400, "INVALID_BODY", "gameUid is required")
+			return
+		}
+		tx, err := db.BeginTx(r.Context(), nil)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		defer tx.Rollback()
+
+		var cur string
+		err = tx.QueryRowContext(r.Context(),
+			`SELECT status FROM orders WHERE order_no=$1 FOR UPDATE`, no).Scan(&cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "ORDER_NOT_FOUND", "order not found")
+			return
+		} else if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if cur != "FAILED" || !CanTransition(Status(cur), Queued) {
+			writeErr(w, 409, "INVALID_STATE", "only FAILED orders can be retried with a new UID (current: "+cur+")")
+			return
+		}
+		if _, err = tx.ExecContext(r.Context(), `
+			UPDATE orders SET status='QUEUED', game_uid=$2, attempts=0, next_attempt_at=NULL,
+			claimed_by=NULL, lease_expires_at=NULL, version=version+1, updated_at=now()
+			WHERE order_no=$1`, no, req.GameUID); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if _, err = tx.ExecContext(r.Context(), `
+			INSERT INTO order_events (order_no, from_status, to_status, reason)
+			VALUES ($1,'FAILED','QUEUED',$2)`, no, "customer corrected UID -> retry"); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if err = tx.Commit(); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		log.Printf("order=%s UID corrected -> QUEUED", no)
+		writeJSON(w, 200, map[string]any{"orderNo": no, "status": "QUEUED"})
+	}
+}
+
+// ขอคืนเงิน: FAILED/DELAYED -> REFUNDED + alert ให้แอดมินโอนคืนจริง
+func requestRefund(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		no := r.PathValue("orderNo")
+		if !orderNoRe.MatchString(no) {
+			writeErr(w, 400, "INVALID_ORDER_NO", "orderNo must match ORD-<digits>-<digits>")
+			return
+		}
+		var req struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req) // reason ไม่บังคับ
+		if strings.TrimSpace(req.Reason) == "" {
+			req.Reason = "customer requested refund"
+		}
+		tx, err := db.BeginTx(r.Context(), nil)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		defer tx.Rollback()
+
+		var cur string
+		err = tx.QueryRowContext(r.Context(),
+			`SELECT status FROM orders WHERE order_no=$1 FOR UPDATE`, no).Scan(&cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "ORDER_NOT_FOUND", "order not found")
+			return
+		} else if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		// ขอคืนเฉพาะออเดอร์ที่จ่ายแล้วแต่เติมไม่สำเร็จ
+		if (cur != "FAILED" && cur != "DELAYED") || !CanTransition(Status(cur), Refunded) {
+			writeErr(w, 409, "INVALID_STATE", "refund allowed only for FAILED or DELAYED orders (current: "+cur+")")
+			return
+		}
+		if _, err = tx.ExecContext(r.Context(), `
+			UPDATE orders SET status='REFUNDED', claimed_by=NULL, lease_expires_at=NULL,
+			next_attempt_at=NULL, version=version+1, updated_at=now() WHERE order_no=$1`, no); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if _, err = tx.ExecContext(r.Context(), `
+			INSERT INTO order_events (order_no, from_status, to_status, reason)
+			VALUES ($1,$2,'REFUNDED',$3)`, no, cur, "refund: "+req.Reason); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if _, err = tx.ExecContext(r.Context(),
+			`INSERT INTO alerts (order_no, type, message) VALUES ($1,'REFUND_REQUIRED',$2)`,
+			no, "refund requested: "+req.Reason); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if err = tx.Commit(); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		log.Printf("order=%s refunded from %s", no, cur)
+		writeJSON(w, 200, map[string]any{"orderNo": no, "status": "REFUNDED"})
+	}
+}
+
 type reaped struct {
 	orderNo, status, oldBot string
 	attempts                int
@@ -811,10 +1073,14 @@ func main() {
 	mux.HandleFunc("GET /orders/{orderNo}", getOrder(db))
 	mux.HandleFunc("GET /orders", listOrders(db))
 	mux.HandleFunc("GET /orders/{orderNo}/timeline", getTimeline(db))
+	mux.HandleFunc("POST /orders/{orderNo}/report-issue", reportIssue(db))
+	mux.HandleFunc("POST /orders/{orderNo}/fix-uid", fixUID(db))
+	mux.HandleFunc("POST /orders/{orderNo}/refund", requestRefund(db))
 
 	mux.HandleFunc("POST /bot/claim", claimOrder(db))
 	mux.HandleFunc("POST /bot/orders/{orderNo}/payment", recordPayment(db))
 	mux.HandleFunc("POST /bot/orders/{orderNo}/heartbeat", heartbeat(db))
+	mux.HandleFunc("POST /bot/orders/{orderNo}/result", botResult(db))
 
 	log.Println("listening :8080")
 	log.Fatal(http.ListenAndServe(":8080", withLogging(mux)))
