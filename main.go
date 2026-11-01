@@ -75,7 +75,7 @@ func createOrder(db *sql.DB) http.HandlerFunc {
 		ctx := r.Context()
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
-			writeErr(w, 500, "INTERNAL", "database error")
+			serverErr(w, r, err)
 			return
 		}
 		defer tx.Rollback()
@@ -92,11 +92,11 @@ func createOrder(db *sql.DB) http.HandlerFunc {
 			if _, err = tx.ExecContext(ctx,
 				`INSERT INTO order_events (order_no, to_status, reason) VALUES ($1, $2, 'order created')`,
 				o.OrderNo, o.Status); err != nil {
-				writeErr(w, 500, "INTERNAL", "database error")
+				serverErr(w, r, err)
 				return
 			}
 			if err = tx.Commit(); err != nil {
-				writeErr(w, 500, "INTERNAL", "database error")
+				serverErr(w, r, err)
 				return
 			}
 			log.Printf("order=%s created", o.OrderNo)
@@ -106,15 +106,15 @@ func createOrder(db *sql.DB) http.HandlerFunc {
 			o, err = scanOrder(tx.QueryRowContext(ctx,
 				`SELECT `+orderCols+` FROM orders WHERE idempotency_key = $1`, key))
 			if err != nil {
-				writeErr(w, 500, "INTERNAL", "database error")
+				serverErr(w, r, err)
 				return
 			}
 			log.Printf("order=%s duplicate request (same key)", o.OrderNo)
 			writeJSON(w, 200, o)
 
 		default:
-			log.Printf("create order error: %v", err)
-			writeErr(w, 500, "INTERNAL", "database error")
+			// log.Printf("create order error: %v", err)
+			serverErr(w, r, err)
 		}
 	}
 }
@@ -134,8 +134,8 @@ func getOrder(db *sql.DB) http.HandlerFunc {
 		case errors.Is(err, sql.ErrNoRows):
 			writeErr(w, 404, "ORDER_NOT_FOUND", "order not found")
 		case err != nil:
-			log.Printf("order=%s get error: %v", no, err)
-			writeErr(w, 500, "INTERNAL", "database error")
+			// log.Printf("order=%s get error: %v", no, err)
+			serverErr(w, r, err)
 		default:
 			writeJSON(w, 200, o)
 		}
@@ -174,7 +174,7 @@ func listOrders(db *sql.DB) http.HandlerFunc {
 		var total int
 		if err := db.QueryRowContext(ctx,
 			`SELECT count(*) FROM orders WHERE status IN `+in).Scan(&total); err != nil {
-			writeErr(w, 500, "INTERNAL", "database error")
+			serverErr(w, r, err)
 			return
 		}
 		rows, err := db.QueryContext(ctx,
@@ -182,7 +182,7 @@ func listOrders(db *sql.DB) http.HandlerFunc {
 				` ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2`,
 			pageSize, (page-1)*pageSize)
 		if err != nil {
-			writeErr(w, 500, "INTERNAL", "database error")
+			serverErr(w, r, err)
 			return
 		}
 		defer rows.Close()
@@ -192,13 +192,13 @@ func listOrders(db *sql.DB) http.HandlerFunc {
 			var o Order
 			if err := rows.Scan(&o.OrderNo, &o.GameUID, &o.Product, &o.Amount,
 				&o.Status, &o.ExpiresAt, &o.CreatedAt); err != nil {
-				writeErr(w, 500, "INTERNAL", "database error")
+				serverErr(w, r, err)
 				return
 			}
 			items = append(items, o)
 		}
 		if err := rows.Err(); err != nil {
-			writeErr(w, 500, "INTERNAL", "database error")
+			serverErr(w, r, err)
 			return
 		}
 		writeJSON(w, 200, map[string]any{
@@ -225,7 +225,7 @@ func getTimeline(db *sql.DB) http.HandlerFunc {
 		var exists bool
 		if err := db.QueryRowContext(ctx,
 			`SELECT EXISTS(SELECT 1 FROM orders WHERE order_no = $1)`, no).Scan(&exists); err != nil {
-			writeErr(w, 500, "INTERNAL", "database error")
+			serverErr(w, r, err)
 			return
 		}
 		if !exists {
@@ -236,7 +236,7 @@ func getTimeline(db *sql.DB) http.HandlerFunc {
 			`SELECT from_status, to_status, reason, created_at
 			FROM order_events WHERE order_no = $1 ORDER BY created_at, id`, no)
 		if err != nil {
-			writeErr(w, 500, "INTERNAL", "database error")
+			serverErr(w, r, err)
 			return
 		}
 		defer rows.Close()
@@ -245,16 +245,118 @@ func getTimeline(db *sql.DB) http.HandlerFunc {
 		for rows.Next() {
 			var e Event
 			if err := rows.Scan(&e.From, &e.To, &e.Reason, &e.CreatedAt); err != nil {
-				writeErr(w, 500, "INTERNAL", "database error")
+				serverErr(w, r, err)
 				return
 			}
 			events = append(events, e)
 		}
 		if err := rows.Err(); err != nil {
-			writeErr(w, 500, "INTERNAL", "database error")
+			serverErr(w, r, err)
 			return
 		}
 		writeJSON(w, 200, map[string]any{"orderNo": no, "events": events})
+	}
+}
+
+// ตัวช่วยจัดการ error และ log
+
+func serverErr(w http.ResponseWriter, r *http.Request, err error) {
+	order := r.PathValue("orderNo")
+	if order == "" {
+		order = "-"
+	}
+	log.Printf("order=%s ERROR %s %s: %v", order, r.Method, r.URL.Path, err)
+	writeErr(w, 500, "INTERNAL", "internal server error")
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+var orderInPath = regexp.MustCompile(`ORD-[0-9]+-[0-9]+`)
+
+func withLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: 200}
+		defer func() {
+			if rec := recover(); rec != nil { // กัน panic ทำให้ server ล้ม
+				log.Printf("PANIC %s %s: %v", r.Method, r.URL.Path, rec)
+				writeErr(sw, 500, "INTERNAL", "internal server error")
+			}
+			order := orderInPath.FindString(r.URL.Path)
+			if order == "" {
+				order = "-"
+			}
+			log.Printf("order=%s %s %s -> %d (%s)", order, r.Method, r.URL.Path,
+				sw.status, time.Since(start).Round(time.Millisecond))
+		}()
+		next.ServeHTTP(sw, r)
+	})
+}
+
+func claimOrder(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			BotID string `json:"botId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BotID == "" {
+			writeErr(w, 400, "INVALID_BODY", "botId is required")
+			return
+		}
+		ctx := r.Context()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		defer tx.Rollback()
+
+		o, err := scanOrder(tx.QueryRowContext(ctx, `
+			WITH next AS (
+				SELECT id FROM orders
+				WHERE status = 'QUEUED'
+				ORDER BY created_at
+				FOR UPDATE SKIP LOCKED
+				LIMIT 1
+			)
+			UPDATE orders o
+			SET status = 'IN_PROGRESS',
+				claimed_by = $1,
+				lease_expires_at = now() + interval '2 minutes',
+				version = o.version + 1,
+				updated_at = now()
+			FROM next
+			WHERE o.id = next.id
+			RETURNING `+orderCols, req.BotID))
+
+		if errors.Is(err, sql.ErrNoRows) { // ไม่มีงานในคิว
+			w.WriteHeader(204)
+			return
+		}
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO order_events (order_no, from_status, to_status, reason)
+			VALUES ($1, 'QUEUED', 'IN_PROGRESS', $2)`,
+			o.OrderNo, "claimed by "+req.BotID); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		log.Printf("order=%s claimed by %s", o.OrderNo, req.BotID)
+		writeJSON(w, 200, o)
 	}
 }
 
@@ -278,7 +380,12 @@ func main() {
 	mux.HandleFunc("GET /orders/{orderNo}", getOrder(db))
 	mux.HandleFunc("GET /orders", listOrders(db))
 	mux.HandleFunc("GET /orders/{orderNo}/timeline", getTimeline(db))
+	mux.HandleFunc("POST /bot/claim", claimOrder(db))
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, 404, "NOT_FOUND", "route not found")
+	})
 
 	log.Println("listening :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Fatal(http.ListenAndServe(":8080", withLogging(mux)))
 }
