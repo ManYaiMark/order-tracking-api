@@ -16,6 +16,11 @@ curl localhost:8080/health
 - ดู alert ที่แอดมินจะเห็น: `docker compose exec db psql -U app -d orders -c "SELECT type, order_no, message FROM alerts ORDER BY id DESC LIMIT 10;"`
 - ค่าตั้งต่างๆ (lease, backoff, secret) อยู่ใน `docker-compose.yml` ค่าใน compose เป็นค่า dev สำหรับ demo
 
+## ทดสอบเร็วด้วย DEV_MODE
+REST Client เซ็น HMAC เองไม่ได้ จึงมีทางลัด `/dev/pay` และ `/dev/expire` ใช้ได้เมื่อ `DEV_MODE=true` ใน compose
+ให้กดจบ flow (สร้าง → จ่าย → bot claim → ผลเติม) ได้ใน `requests.http` โดยไม่ต้องเซ็นเอง
+⚠️ `/dev/*` ข้ามการตรวจลายเซ็นจริง ห้ามเปิดใน production
+
 ## Endpoints
 
 | Method | Path | ใครเรียก | หน้าที่ |
@@ -33,6 +38,8 @@ curl localhost:8080/health
 | POST | /bot/orders/:orderNo/payment | bot | บันทึกการจ่ายเงิน |
 | POST | /bot/orders/:orderNo/result | bot | รายงานผลเติม (`SUCCESS`/`TRANSIENT`/`PERMANENT`) |
 | GET | /health | - | เช็กว่าระบบทำงาน |
+| POST | /dev/pay/:orderNo | ทดสอบ (DEV_MODE) | จำลองธนาคารแจ้งเงินเข้า ใช้ logic เดียวกับ /webhooks/bank |
+| POST | /dev/expire/:orderNo | ทดสอบ (DEV_MODE) | ทำให้ออเดอร์ PENDING_PAYMENT หมดอายุ |
 
 ทุก error ใช้รูปแบบเดียว: `{"error":{"code":"...","message":"..."}}`
 

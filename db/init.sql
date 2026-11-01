@@ -47,7 +47,7 @@ CREATE TABLE alerts (
 CREATE TABLE IF NOT EXISTS webhook_events (
     event_id    text PRIMARY KEY,
     order_no    text NOT NULL REFERENCES orders(order_no),
-    type        text NOT NULL,
+    type        text ,
     outcome     text NOT NULL,
     received_at timestamptz NOT NULL DEFAULT now()
 );
