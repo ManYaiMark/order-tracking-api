@@ -318,10 +318,28 @@ func claimOrder(db *sql.DB) http.HandlerFunc {
 		}
 		defer tx.Rollback()
 
+		// o, err := scanOrder(tx.QueryRowContext(ctx, `
+		// 	WITH next AS (
+		// 		SELECT id FROM orders
+		// 		WHERE status = 'QUEUED'
+		// 		ORDER BY created_at
+		// 		FOR UPDATE SKIP LOCKED
+		// 		LIMIT 1
+		// 	)
+		// 	UPDATE orders o
+		// 	SET status = 'IN_PROGRESS',
+		// 		claimed_by = $1,
+		// 		lease_expires_at = now() + interval '2 minutes',
+		// 		version = o.version + 1,
+		// 		updated_at = now()
+		// 	FROM next
+		// 	WHERE o.id = next.id
+		// 	RETURNING `+orderCols, req.BotID))
 		o, err := scanOrder(tx.QueryRowContext(ctx, `
 			WITH next AS (
 				SELECT id FROM orders
 				WHERE status = 'QUEUED'
+				AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 				ORDER BY created_at
 				FOR UPDATE SKIP LOCKED
 				LIMIT 1
@@ -329,12 +347,13 @@ func claimOrder(db *sql.DB) http.HandlerFunc {
 			UPDATE orders o
 			SET status = 'IN_PROGRESS',
 				claimed_by = $1,
-				lease_expires_at = now() + interval '2 minutes',
+				lease_expires_at = now() + $2::int * interval '1 second',
+				next_attempt_at = NULL,
 				version = o.version + 1,
 				updated_at = now()
 			FROM next
 			WHERE o.id = next.id
-			RETURNING `+orderCols, req.BotID))
+			RETURNING `+orderCols, req.BotID, leaseSeconds))
 
 		if errors.Is(err, sql.ErrNoRows) { // ไม่มีงานในคิว
 			w.WriteHeader(204)
@@ -431,8 +450,139 @@ func recordPayment(db *sql.DB) http.HandlerFunc {
 	}
 }
 
+func envInt(name string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+		return v
+	}
+	return def
+}
+
+var (
+	leaseSeconds = envInt("LEASE_SECONDS", 120)
+	maxRetries   = envInt("MAX_RETRIES", 3)
+	backoffBase  = envInt("BACKOFF_BASE_SECONDS", 10)
+	reaperEvery  = envInt("REAPER_INTERVAL_SECONDS", 10)
+)
+
+// bot ส่งสัญญาณว่ายังมีชีวิต → ต่ออายุ lease
+func heartbeat(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		no := r.PathValue("orderNo")
+		if !orderNoRe.MatchString(no) {
+			writeErr(w, 400, "INVALID_ORDER_NO", "orderNo must match ORD-<digits>-<digits>")
+			return
+		}
+		var req struct {
+			BotID string `json:"botId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BotID == "" {
+			writeErr(w, 400, "INVALID_BODY", "botId is required")
+			return
+		}
+		res, err := db.ExecContext(r.Context(), `
+			UPDATE orders SET lease_expires_at = now() + $3::int * interval '1 second',
+							updated_at = now()
+			WHERE order_no = $1 AND status = 'IN_PROGRESS' AND claimed_by = $2`,
+			no, req.BotID, leaseSeconds)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			writeErr(w, 409, "LEASE_LOST", "order is not IN_PROGRESS or not claimed by this bot")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"orderNo": no, "leaseSeconds": leaseSeconds})
+	}
+}
+
+type reaped struct {
+	orderNo, status, oldBot string
+	attempts                int
+}
+
+// กวาดออเดอร์ที่ lease หมด: retry (backoff) หรือย้ายเป็น DELAYED + alert
+func reapExpiredLeases(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		WITH expired AS (
+			SELECT id, claimed_by AS old_bot FROM orders
+			WHERE status = 'IN_PROGRESS' AND lease_expires_at < now()
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE orders o SET
+			status = CASE WHEN o.attempts < $1 THEN 'QUEUED' ELSE 'DELAYED' END,
+			attempts = CASE WHEN o.attempts < $1 THEN o.attempts + 1 ELSE o.attempts END,
+			next_attempt_at = CASE WHEN o.attempts < $1
+				THEN now() + ($2::int * power(2, o.attempts)::int) * interval '1 second' END,
+			claimed_by = NULL, lease_expires_at = NULL,
+			version = o.version + 1, updated_at = now()
+		FROM expired e
+		WHERE o.id = e.id
+		RETURNING o.order_no, o.status, o.attempts, e.old_bot`, maxRetries, backoffBase)
+	if err != nil {
+		return err
+	}
+	var list []reaped
+	for rows.Next() {
+		var x reaped
+		var oldBot sql.NullString
+		if err := rows.Scan(&x.orderNo, &x.status, &x.attempts, &oldBot); err != nil {
+			rows.Close()
+			return err
+		}
+		x.oldBot = oldBot.String
+		list = append(list, x)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, x := range list {
+		var reason string
+		if x.status == "QUEUED" {
+			reason = fmt.Sprintf("lease expired (bot=%s); retry %d/%d queued", x.oldBot, x.attempts, maxRetries)
+			log.Printf("order=%s %s", x.orderNo, reason)
+		} else {
+			reason = fmt.Sprintf("lease expired (bot=%s); max retries reached -> DELAYED", x.oldBot)
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO alerts (order_no, type, message) VALUES ($1, 'BOT_UNRESPONSIVE', $2)`,
+				x.orderNo, reason); err != nil {
+				return err
+			}
+			log.Printf("order=%s ALERT %s", x.orderNo, reason)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO order_events (order_no, from_status, to_status, reason)
+			VALUES ($1, 'IN_PROGRESS', $2, $3)`, x.orderNo, x.status, reason); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func startReaper(db *sql.DB) {
+	go func() {
+		t := time.NewTicker(time.Duration(reaperEvery) * time.Second)
+		defer t.Stop()
+		for range t.C {
+			if err := reapExpiredLeases(context.Background(), db); err != nil {
+				log.Printf("ERROR reaper: %v", err)
+			}
+		}
+	}()
+}
+
 func main() {
 	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+	startReaper(db)
+
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -459,6 +609,7 @@ func main() {
 
 	mux.HandleFunc("POST /bot/claim", claimOrder(db))
 	mux.HandleFunc("POST /bot/orders/{orderNo}/payment", recordPayment(db))
+	mux.HandleFunc("POST /bot/orders/{orderNo}/heartbeat", heartbeat(db))
 
 	log.Println("listening :8080")
 	log.Fatal(http.ListenAndServe(":8080", withLogging(mux)))

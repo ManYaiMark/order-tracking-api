@@ -14,6 +14,7 @@ CREATE TABLE orders (
     claimed_by       TEXT,                        -- bot ที่จับงาน
     lease_expires_at TIMESTAMPTZ,                 -- heartbeat/lease
     expires_at       TIMESTAMPTZ,                 -- หมดอายุ QR (เคส 5)
+    next_attempt_at  TIMESTAMPTZ,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -32,6 +33,14 @@ CREATE TABLE payments (
     order_no   TEXT NOT NULL UNIQUE REFERENCES orders(order_no), -- 1 ออเดอร์จ่ายได้ครั้งเดียว
     bot_id     TEXT NOT NULL,
     amount     NUMERIC(12,2) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE alerts (
+    id         BIGSERIAL PRIMARY KEY,
+    order_no   TEXT NOT NULL REFERENCES orders(order_no),
+    type       TEXT NOT NULL,
+    message    TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

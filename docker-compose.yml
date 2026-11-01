@@ -19,6 +19,10 @@ services:
     build: .
     environment:
       DATABASE_URL: postgres://app:app@db:5432/orders?sslmode=disable
+      LEASE_SECONDS: "15"
+      BACKOFF_BASE_SECONDS: "5"
+      REAPER_INTERVAL_SECONDS: "5"
+      MAX_RETRIES: "3"
     ports:
       - "8080:8080"
     depends_on:
