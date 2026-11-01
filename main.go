@@ -1054,6 +1054,12 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+
+	if os.Getenv("DEV_MODE") == "true" {
+		mux.HandleFunc("POST /dev/pay/{orderNo}", devPay(db))
+		mux.HandleFunc("POST /dev/expire/{orderNo}", devExpire(db))
+		log.Println("DEV_MODE on: /dev/* helpers enabled")
+	}
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -1091,4 +1097,54 @@ func backoffDelay(base, attempts int) time.Duration {
 		attempts = 0
 	}
 	return time.Duration(base) * time.Second * time.Duration(1<<attempts)
+}
+
+// DEV_MODE เท่านั้น: จำลอง "ธนาคารแจ้งเงินเข้า" โดยเซ็นลายเซ็นให้ แล้วส่งเข้า handler webhook ตัวจริง
+// body ไม่บังคับ: {"eventId":"..."} (ใส่ eventId เดิมซ้ำเพื่อทดสอบ duplicate)
+func devPay(db *sql.DB) http.HandlerFunc {
+	hook := bankWebhook(db)
+	return func(w http.ResponseWriter, r *http.Request) {
+		no := r.PathValue("orderNo")
+		if !orderNoRe.MatchString(no) {
+			writeErr(w, 400, "INVALID_ORDER_NO", "orderNo must match ORD-<digits>-<digits>")
+			return
+		}
+		var in struct {
+			EventID string `json:"eventId"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		if in.EventID == "" {
+			in.EventID = fmt.Sprintf("dev-%s-%d", no, time.Now().UnixNano())
+		}
+		body := fmt.Sprintf(`{"eventId":"%s","orderNo":"%s","type":"payment.succeeded"}`, in.EventID, no)
+		m := hmac.New(sha256.New, []byte(webhookSecret))
+		m.Write([]byte(body))
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "/webhooks/bank", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Signature", hex.EncodeToString(m.Sum(nil)))
+		hook(w, req)
+	}
+}
+
+// DEV_MODE เท่านั้น: ทำให้ออเดอร์ PENDING_PAYMENT หมดอายุทันที (reaper จะย้ายเป็น EXPIRED ภายใน ~5 วินาที)
+func devExpire(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		no := r.PathValue("orderNo")
+		if !orderNoRe.MatchString(no) {
+			writeErr(w, 400, "INVALID_ORDER_NO", "orderNo must match ORD-<digits>-<digits>")
+			return
+		}
+		res, err := db.ExecContext(r.Context(),
+			`UPDATE orders SET expires_at = now() - interval '1 minute'
+			WHERE order_no=$1 AND status='PENDING_PAYMENT'`, no)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			writeErr(w, 409, "INVALID_STATE", "order is not PENDING_PAYMENT")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"orderNo": no, "note": "will be EXPIRED within ~5s"})
+	}
 }

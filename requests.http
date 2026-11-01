@@ -1,5 +1,75 @@
 # Order Tracking API - ทดสอบด้วย VS Code + ส่วนเสริม REST Client
-#
+
+### ===== ทดสอบเร็ว (กดไล่จากบนลงล่าง ต้องกดให้เสร็จในไม่กี่วินาที เพราะ lease 15 วินาที) =====
+
+### Q1) สร้างออเดอร์ (key สุ่มใหม่ทุกครั้ง)
+# @name quickCreate
+POST {{host}}/orders
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{"gameUid":"123456789","product":"Diamond 100","amount":99}
+
+###
+@qOrder = {{quickCreate.response.body.orderNo}}
+
+### Q2) จำลองธนาคารแจ้งเงินเข้า -> PENDING_PAYMENT เป็น QUEUED (DEV_MODE)
+POST {{host}}/dev/pay/{{qOrder}}
+
+### Q3) bot รับงาน -> IN_PROGRESS
+# @name quickClaim
+POST {{host}}/bot/claim
+Content-Type: application/json
+
+{"botId":"bot-1"}
+
+###
+@qClaimed = {{quickClaim.response.body.orderNo}}
+
+### Q4) bot บันทึกการจ่าย -> 201
+POST {{host}}/bot/orders/{{qClaimed}}/payment
+Content-Type: application/json
+
+{"botId":"bot-1"}
+
+### Q5) ผลเติม -> COMPLETED (เปลี่ยน outcome เป็น PERMANENT / TRANSIENT เพื่อลองเคส 4)
+POST {{host}}/bot/orders/{{qClaimed}}/result
+Content-Type: application/json
+
+{"botId":"bot-1","outcome":"SUCCESS"}
+
+### Q6) ดู timeline ทั้งเส้นทาง
+GET {{host}}/orders/{{qClaimed}}/timeline
+
+### ----- ทดสอบเคส 3: จ่ายซ้ำ (ใช้ออเดอร์ Q1 ที่ผ่าน Q2 แล้ว) -----
+### ส่ง eventId เดิมซ้ำ 2 ครั้ง -> ครั้งแรกอาจเป็น ignored ครั้งที่สอง duplicate
+POST {{host}}/dev/pay/{{qOrder}}
+Content-Type: application/json
+
+{"eventId":"same-event"}
+
+### ----- ทดสอบเคส 5: หมดอายุ แล้วจ่ายมาช้า -----
+### E1) สร้างออเดอร์ใหม่
+# @name expCreate
+POST {{host}}/orders
+Content-Type: application/json
+Idempotency-Key: {{$guid}}
+
+{"gameUid":"123456789","product":"Diamond 100","amount":99}
+
+###
+@eOrder = {{expCreate.response.body.orderNo}}
+
+### E2) ทำให้หมดอายุ (รอ ~5 วินาที)
+POST {{host}}/dev/expire/{{eOrder}}
+
+### E3) ตรวจ -> EXPIRED
+GET {{host}}/orders/{{eOrder}}
+
+### E4) จ่ายมาช้า -> REFUNDED + alert REFUND_REQUIRED
+POST {{host}}/dev/pay/{{eOrder}}
+
+
 # ลำดับใช้งานปกติ (happy path):
 #   1) createOrder            -> ได้ orderNo (เก็บเข้าตัวแปรอัตโนมัติ)
 #   2) webhook ธนาคาร         -> PENDING_PAYMENT -> QUEUED (ต้องเซ็น HMAC ดู README หัวข้อเคส 3)

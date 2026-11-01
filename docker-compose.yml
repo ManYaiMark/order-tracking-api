@@ -24,6 +24,7 @@ services:
       BACKOFF_BASE_SECONDS: "5"
       REAPER_INTERVAL_SECONDS: "5"
       MAX_RETRIES: "3"
+      DEV_MODE: "true"
     ports:
       - "8080:8080"
     depends_on:
