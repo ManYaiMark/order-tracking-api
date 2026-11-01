@@ -1085,3 +1085,10 @@ func main() {
 	log.Println("listening :8080")
 	log.Fatal(http.ListenAndServe(":8080", withLogging(mux)))
 }
+
+func backoffDelay(base, attempts int) time.Duration {
+	if attempts < 0 {
+		attempts = 0
+	}
+	return time.Duration(base) * time.Second * time.Duration(1<<attempts)
+}
