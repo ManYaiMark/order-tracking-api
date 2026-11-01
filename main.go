@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
@@ -656,7 +660,130 @@ func alertStaleQueue(ctx context.Context, db *sql.DB) error {
 	return rows.Err()
 }
 
+var webhookSecret = os.Getenv("WEBHOOK_SECRET")
+
+func validSignature(secret string, body []byte, sigHex string) bool {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	got, err := hex.DecodeString(sigHex)
+	return err == nil && hmac.Equal(got, mac.Sum(nil))
+}
+
+func bankWebhook(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err != nil {
+			writeErr(w, 400, "INVALID_BODY", "cannot read body")
+			return
+		}
+		// 1) ตรวจลายเซ็นก่อนทำอย่างอื่น
+		if !validSignature(webhookSecret, body, r.Header.Get("X-Signature")) {
+			writeErr(w, 401, "INVALID_SIGNATURE", "signature mismatch")
+			return
+		}
+		var ev struct {
+			EventID string `json:"eventId"`
+			OrderNo string `json:"orderNo"`
+			Type    string `json:"type"`
+		}
+		if err := json.Unmarshal(body, &ev); err != nil || ev.EventID == "" || !orderNoRe.MatchString(ev.OrderNo) {
+			writeErr(w, 400, "INVALID_BODY", "eventId and a valid orderNo are required")
+			return
+		}
+		if ev.Type != "payment.succeeded" {
+			writeErr(w, 400, "UNSUPPORTED_EVENT", "only payment.succeeded is supported")
+			return
+		}
+
+		ctx := r.Context()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		defer tx.Rollback()
+
+		// 2) event ซ้ำ? (ตอบ 200 เพื่อให้ธนาคารเลิกส่งซ้ำ)
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO webhook_events (event_id, order_no, type) VALUES ($1, $2, $3)
+			ON CONFLICT (event_id) DO NOTHING`, ev.EventID, ev.OrderNo, ev.Type)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			log.Printf("order=%s webhook %s duplicate ignored", ev.OrderNo, ev.EventID)
+			writeJSON(w, 200, map[string]string{"status": "duplicate"})
+			return
+		}
+
+		// 3) ล็อกออเดอร์แล้วดูสถานะ "ตอนนี้" ก่อนตัดสินใจ
+		var from Status
+		err = tx.QueryRowContext(ctx,
+			`SELECT status FROM orders WHERE order_no = $1 FOR UPDATE`, ev.OrderNo).Scan(&from)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, 404, "ORDER_NOT_FOUND", "order not found") // rollback ลบ event ด้วย
+			return
+		}
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+
+		var next Status
+		var reason, alertType string
+		switch from {
+		case PendingPayment:
+			next, reason = Queued, "bank payment confirmed ("+ev.EventID+")"
+		case Expired: // มาช้าหลังหมดอายุ → คืนเงิน
+			next, reason, alertType = Refunded, "late payment after expiry -> refund ("+ev.EventID+")", "REFUND_REQUIRED"
+		default: // สถานะอื่น = ซ้ำซ้อน/ผิดลำดับ ไม่แตะสถานะ แต่แจ้งแอดมิน
+			reason, alertType = "payment event in state "+string(from)+" ignored ("+ev.EventID+")", "UNEXPECTED_PAYMENT"
+		}
+
+		outcome := "ignored"
+		if next != "" && CanTransition(from, next) {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE orders SET status = $2, version = version + 1, updated_at = now()
+				WHERE order_no = $1`, ev.OrderNo, string(next)); err != nil {
+				serverErr(w, r, err)
+				return
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO order_events (order_no, from_status, to_status, reason)
+				VALUES ($1, $2, $3, $4)`, ev.OrderNo, string(from), string(next), reason); err != nil {
+				serverErr(w, r, err)
+				return
+			}
+			outcome = string(next)
+		}
+		if alertType != "" {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO alerts (order_no, type, message) VALUES ($1, $2, $3)`,
+				ev.OrderNo, alertType, reason); err != nil {
+				serverErr(w, r, err)
+				return
+			}
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE webhook_events SET outcome = $2 WHERE event_id = $1`, ev.EventID, outcome); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		log.Printf("order=%s webhook %s %s -> %s", ev.OrderNo, ev.EventID, from, outcome)
+		writeJSON(w, 200, map[string]string{"status": "processed", "outcome": outcome})
+	}
+}
+
 func main() {
+	webhookSecret = os.Getenv("WEBHOOK_SECRET")
+	if webhookSecret == "" {
+		log.Fatal("WEBHOOK_SECRET is required")
+	}
 	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 	startReaper(db)
 
@@ -675,6 +802,7 @@ func main() {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
 
+	mux.HandleFunc("POST /webhooks/bank", bankWebhook(db))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "NOT_FOUND", "route not found")
 	})

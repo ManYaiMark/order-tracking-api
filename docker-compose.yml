@@ -18,6 +18,7 @@ services:
   api:
     build: .
     environment:
+      WEBHOOK_SECRET: dev-secret-change-me
       DATABASE_URL: postgres://app:app@db:5432/orders?sslmode=disable
       LEASE_SECONDS: "15"
       BACKOFF_BASE_SECONDS: "5"

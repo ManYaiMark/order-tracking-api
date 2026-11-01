@@ -63,7 +63,23 @@ log: retry 1/3 (รอ ~5s) → retry 2/3 (รอ ~10s) → retry 3/3 (รอ ~2
 - ทดสอบ: ยิง 10 bot พร้อมกันต่อ 1 ออเดอร์ → ชนะ 1 ตัวเสมอ ที่เหลือได้ 204
 - ทางเลือกที่ไม่เลือก: optimistic lock (version) ต้องคอย retry เมื่อชน
 
-### เคส 3: Webhook ธนาคารซ้ำ/ช้า
+### เคส 3: Webhook ธนาคารซ้ำ/ช้า/ผิดลำดับ
+`POST /webhooks/bank` body: `{"eventId","orderNo","type":"payment.succeeded"}`
+
+ด่านที่ระบบผ่านตามลำดับ:
+1. **ตรวจลายเซ็น**: HMAC-SHA256 ของ body ดิบ (header `X-Signature`, hex, secret จาก env `WEBHOOK_SECRET`) เทียบด้วย `hmac.Equal` ผิด → 401 `INVALID_SIGNATURE`
+2. **กัน event ซ้ำ**: ตาราง `webhook_events` มี `event_id` เป็น PK ใช้ `INSERT ... ON CONFLICT DO NOTHING` ซ้ำ → 200 `duplicate` ไม่เปลี่ยนอะไร
+3. **เทียบสถานะ**: `SELECT ... FOR UPDATE` แล้วตัดสินตามสถานะปัจจุบัน และเช็ก `CanTransition` ก่อนเปลี่ยนเสมอ
+
+| สถานะตอน webhook มา | ผล |
+|---|---|
+| `PENDING_PAYMENT` | → `QUEUED` |
+| `EXPIRED` (มาช้าหลังหมดอายุ) | → `REFUNDED` + alert `REFUND_REQUIRED` |
+| สถานะอื่น (จ่ายซ้ำ/ผิดจังหวะ) | ไม่แตะสถานะ + alert `UNEXPECTED_PAYMENT` |
+
+ทุกอย่างอยู่ใน transaction เดียว (กันซ้ำ + เปลี่ยนสถานะ + เขียน timeline) ถ้าพังกลางทางจะ rollback event จึงไม่ถูกนับว่าประมวลผลแล้ว ธนาคารส่งซ้ำได้อย่างปลอดภัย
+เหตุผล: ลายเซ็นกันคนปลอม, event id กันซ้ำ, การล็อกแถว + เทียบสถานะกัน webhook ที่ช้าหรือผิดลำดับทำสถานะย้อนกลับ, เงินเข้าหลังหมดอายุต้องคืนเงินไม่ใช่เงียบ
+ทดสอบ: ลายเซ็นผิด → 401, ส่ง event เดิมซ้ำ → `duplicate`, จ่ายหลังหมดอายุ → `REFUNDED`, ออเดอร์ไม่มี → 404
 
 
 ### เคส 4: เติมไม่สำเร็จ
