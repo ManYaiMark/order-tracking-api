@@ -360,6 +360,77 @@ func claimOrder(db *sql.DB) http.HandlerFunc {
 	}
 }
 
+func recordPayment(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		no := r.PathValue("orderNo")
+		if !orderNoRe.MatchString(no) {
+			writeErr(w, 400, "INVALID_ORDER_NO", "orderNo must match ORD-<digits>-<digits>")
+			return
+		}
+		var req struct {
+			BotID string `json:"botId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.BotID == "" {
+			writeErr(w, 400, "INVALID_BODY", "botId is required")
+			return
+		}
+		ctx := r.Context()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			serverErr(w, r, err)
+			return
+		}
+		defer tx.Rollback()
+
+		// บันทึกได้เฉพาะ: ออเดอร์ IN_PROGRESS และ bot คนนี้เป็นเจ้าของ
+		var paymentID int64
+		err = tx.QueryRowContext(ctx, `
+			INSERT INTO payments (order_no, bot_id, amount)
+			SELECT order_no, $2::text, amount FROM orders
+			WHERE order_no = $1 AND status = 'IN_PROGRESS' AND claimed_by = $2::text
+			ON CONFLICT (order_no) DO NOTHING
+			RETURNING id`, no, req.BotID).Scan(&paymentID)
+
+		switch {
+		case err == nil:
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO order_events (order_no, from_status, to_status, reason)
+				VALUES ($1, 'IN_PROGRESS', 'IN_PROGRESS', $2)`,
+				no, "payment recorded by "+req.BotID); err != nil {
+				serverErr(w, r, err)
+				return
+			}
+			if err := tx.Commit(); err != nil {
+				serverErr(w, r, err)
+				return
+			}
+			log.Printf("order=%s payment recorded by %s", no, req.BotID)
+			writeJSON(w, 201, map[string]any{"orderNo": no, "paymentId": paymentID, "botId": req.BotID})
+
+		case errors.Is(err, sql.ErrNoRows): // ไม่ได้ insert → หาสาเหตุ
+			var paid, exists bool
+			if err := tx.QueryRowContext(ctx,
+				`SELECT EXISTS(SELECT 1 FROM payments WHERE order_no = $1),
+						EXISTS(SELECT 1 FROM orders WHERE order_no = $1)`, no).Scan(&paid, &exists); err != nil {
+				serverErr(w, r, err)
+				return
+			}
+			switch {
+			case paid:
+				log.Printf("order=%s duplicate payment blocked (bot=%s)", no, req.BotID)
+				writeErr(w, 409, "DUPLICATE_PAYMENT", "payment already recorded for this order")
+			case !exists:
+				writeErr(w, 404, "ORDER_NOT_FOUND", "order not found")
+			default:
+				writeErr(w, 409, "NOT_CLAIMED", "order is not IN_PROGRESS or not claimed by this bot")
+			}
+
+		default:
+			serverErr(w, r, err)
+		}
+	}
+}
+
 func main() {
 	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 	if err != nil {
@@ -376,15 +447,18 @@ func main() {
 		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("POST /orders", createOrder(db))
-	mux.HandleFunc("GET /orders/{orderNo}", getOrder(db))
-	mux.HandleFunc("GET /orders", listOrders(db))
-	mux.HandleFunc("GET /orders/{orderNo}/timeline", getTimeline(db))
-	mux.HandleFunc("POST /bot/claim", claimOrder(db))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "NOT_FOUND", "route not found")
 	})
+
+	mux.HandleFunc("POST /orders", createOrder(db))
+	mux.HandleFunc("GET /orders/{orderNo}", getOrder(db))
+	mux.HandleFunc("GET /orders", listOrders(db))
+	mux.HandleFunc("GET /orders/{orderNo}/timeline", getTimeline(db))
+
+	mux.HandleFunc("POST /bot/claim", claimOrder(db))
+	mux.HandleFunc("POST /bot/orders/{orderNo}/payment", recordPayment(db))
 
 	log.Println("listening :8080")
 	log.Fatal(http.ListenAndServe(":8080", withLogging(mux)))

@@ -42,3 +42,28 @@ GET http://localhost:8080/orders/ORD-1793546033904-165/timeline
 
 ### timeline ไม่พบ → 404
 GET http://localhost:8080/orders/ORD-1111111111111-111/timeline
+
+
+### bot-1 บันทึกการจ่าย → 201
+POST http://localhost:8080/bot/orders/ORD-1793546033904-165/payment
+Content-Type: application/json
+
+{"botId":"bot-1"}
+
+### ส่งซ้ำ → 409 DUPLICATE_PAYMENT
+POST http://localhost:8080/bot/orders/ORD-1793546033904-165/payment
+Content-Type: application/json
+
+{"botId":"bot-1"}
+
+### ออเดอร์ที่ไม่ใช่ IN_PROGRESS → 409 NOT_CLAIMED
+POST http://localhost:8080/bot/orders/ORD-1700000000002-002/payment
+Content-Type: application/json
+
+{"botId":"bot-1"}
+
+### ไม่มีออเดอร์ → 404
+POST http://localhost:8080/bot/orders/ORD-1111111111111-111/payment
+Content-Type: application/json
+
+{"botId":"bot-1"}

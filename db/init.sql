@@ -27,5 +27,13 @@ CREATE TABLE order_events (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE payments (
+    id         BIGSERIAL PRIMARY KEY,
+    order_no   TEXT NOT NULL UNIQUE REFERENCES orders(order_no), -- 1 ออเดอร์จ่ายได้ครั้งเดียว
+    bot_id     TEXT NOT NULL,
+    amount     NUMERIC(12,2) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX idx_orders_status_created ON orders (status, created_at DESC);
 CREATE INDEX idx_events_order ON order_events (order_no, created_at);
