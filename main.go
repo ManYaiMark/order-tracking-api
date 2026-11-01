@@ -572,11 +572,88 @@ func startReaper(db *sql.DB) {
 		t := time.NewTicker(time.Duration(reaperEvery) * time.Second)
 		defer t.Stop()
 		for range t.C {
-			if err := reapExpiredLeases(context.Background(), db); err != nil {
-				log.Printf("ERROR reaper: %v", err)
+			ctx := context.Background()
+			if err := reapExpiredLeases(ctx, db); err != nil {
+				log.Printf("ERROR reaper leases: %v", err)
+			}
+			if err := expirePendingOrders(ctx, db); err != nil {
+				log.Printf("ERROR reaper expire: %v", err)
+			}
+			if err := alertStaleQueue(ctx, db); err != nil {
+				log.Printf("ERROR reaper sla: %v", err)
 			}
 		}
 	}()
+}
+
+var queueSLA = envInt("QUEUE_SLA_SECONDS", 300)
+
+// PENDING_PAYMENT ที่เลยเวลา → EXPIRED (รันซ้ำได้ ไม่เสียหาย เพราะเลือกเฉพาะที่ยัง PENDING_PAYMENT)
+func expirePendingOrders(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+		WITH due AS (
+			SELECT id FROM orders
+			WHERE status = 'PENDING_PAYMENT' AND expires_at < now()
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE orders o SET status = 'EXPIRED', version = o.version + 1, updated_at = now()
+		FROM due WHERE o.id = due.id
+		RETURNING o.order_no`)
+	if err != nil {
+		return err
+	}
+	var nos []string
+	for rows.Next() {
+		var no string
+		if err := rows.Scan(&no); err != nil {
+			rows.Close()
+			return err
+		}
+		nos = append(nos, no)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, no := range nos {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO order_events (order_no, from_status, to_status, reason)
+			VALUES ($1, 'PENDING_PAYMENT', 'EXPIRED', 'payment window elapsed')`, no); err != nil {
+			return err
+		}
+		log.Printf("order=%s expired (no payment)", no)
+	}
+	return tx.Commit()
+}
+
+// QUEUED นานเกิน SLA → สร้าง alert (ออเดอร์ละ 1 ครั้ง)
+func alertStaleQueue(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `
+		INSERT INTO alerts (order_no, type, message)
+		SELECT o.order_no, 'QUEUE_SLA_BREACH', 'queued longer than ' || $1::int || 's'
+		FROM orders o
+		WHERE o.status = 'QUEUED'
+		  	AND o.updated_at < now() - $1::int * interval '1 second'
+			AND NOT EXISTS (SELECT 1 FROM alerts a
+				WHERE a.order_no = o.order_no AND a.type = 'QUEUE_SLA_BREACH')
+		RETURNING order_no`, queueSLA)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var no string
+		if err := rows.Scan(&no); err != nil {
+			return err
+		}
+		log.Printf("order=%s ALERT queued longer than %ds", no, queueSLA)
+	}
+	return rows.Err()
 }
 
 func main() {
