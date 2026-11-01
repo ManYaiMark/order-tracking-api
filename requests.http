@@ -1,0 +1,44 @@
+### สร้างออเดอร์
+POST http://localhost:8080/orders
+Content-Type: application/json
+Idempotency-Key: key-001
+
+{"gameUid":"123456789","product":"Diamond 100","amount":99}
+
+### ไม่ใส่ Idempotency-Key (ควรได้ 400)
+POST http://localhost:8080/orders
+Content-Type: application/json
+
+{"gameUid":"123456789","product":"Diamond 100","amount":99}
+
+
+### พบออเดอร์ → 200
+GET http://localhost:8080/orders/ORD-1793546033904-165
+
+### format ผิด → 400
+GET http://localhost:8080/orders/abc
+
+### format ถูกแต่ไม่มีในระบบ → 404
+GET http://localhost:8080/orders/ORD-1111111111111-111
+
+
+### current หน้า 1
+GET http://localhost:8080/orders?tab=current&page=1
+
+### current หน้า 2
+GET http://localhost:8080/orders?tab=current&page=2
+
+### history
+GET http://localhost:8080/orders?tab=history
+
+### tab ผิด → 400
+GET http://localhost:8080/orders?tab=abc
+
+### page ผิด → 400
+GET http://localhost:8080/orders?page=0
+
+### timeline → 200 (ใส่ orderNo จริงจาก Step 3)
+GET http://localhost:8080/orders/ORD-1793546033904-165/timeline
+
+### timeline ไม่พบ → 404
+GET http://localhost:8080/orders/ORD-1111111111111-111/timeline
